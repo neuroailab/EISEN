@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="PublishConfigData" autoUpload="Always" serverName="CCN2" remoteFilesAllowedToDisappearOnAutoupload="false">
+    <serverData>
+      <paths name="node2-ccn2">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/data2/honglinc/EISEN" local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
+      <paths name="node3-ccn2">
+        <serverdata>
+          <mappings>
+            <mapping deploy="/data2/honglinc/EISEN" local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
+    </serverData>
+    <option name="myAutoUpload" value="ALWAYS" />
+  </component>
+</project>
