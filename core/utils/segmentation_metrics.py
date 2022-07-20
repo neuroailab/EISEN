@@ -524,12 +524,12 @@ def measure_static_segmentation_metric(out, inputs, size, segment_key,
                                      exclude_pred_ids=exclude_pred_ids)
 
         metric.compute_matched_IoUs(exclude_gt_ids=list(set([0] + exclude_values)))
-        metric.compute_recalls()
-        metric.compute_boundary_f_measures(exclude_gt_ids=list(set([0] + exclude_values)))
+        # metric.compute_recalls()
+        # metric.compute_boundary_f_measures(exclude_gt_ids=list(set([0] + exclude_values)))
 
         results['mean_ious'].append(metric.mean_ious)
-        results['recalls'].append(metric.recalls)
-        results['boundary_f1_scores'].append(metric.mean_boundary_f1_scores)
+        # results['recalls'].append(metric.recalls)
+        # results['boundary_f1_scores'].append(metric.mean_boundary_f1_scores)
 
         for k, v in results.items():
             segment_metric[f'metric_{key}_{k}'] = torch.tensor(np.mean(v))

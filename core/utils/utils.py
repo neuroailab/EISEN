@@ -135,7 +135,7 @@ def reorder_int_labels(x):
     return y
 
 
-def generate_local_indices(img_size, K, padding='reflection'):
+def generate_local_indices(img_size, K, padding='constant'):
     H, W = img_size
     indice_maps = torch.arange(H * W).reshape([1, 1, H, W]).float()
 

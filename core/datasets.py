@@ -10,6 +10,7 @@ from torch.utils.data import Dataset
 from torch.utils.data import DataLoader
 from torchvision.io import read_image
 import matplotlib.pyplot as plt
+import shutil
 import logging
 
 class PlayroomDataset(Dataset):
@@ -27,6 +28,10 @@ class PlayroomDataset(Dataset):
             self.file_list = glob.glob(os.path.join(dataset_dir, 'images', 'model_split_[0-9]*', '*[0-8]'))
         else:
             self.file_list = glob.glob(os.path.join(dataset_dir, 'images', 'model_split_[0-3]', '*9'))
+
+        if args.precompute_flow: # precompute flows for training and validation dataset
+            self.file_list = glob.glob(os.path.join(dataset_dir, 'images', 'model_split_[0-3]', '*9')) # glob.glob(os.path.join(dataset_dir, 'images', 'model_split_[0-9]*', '*[0-8]')) #+ \
+
 
     def __len__(self):
         return len(self.file_list)
@@ -84,10 +89,8 @@ class PlayroomDataset(Dataset):
         return segment_map
 
 
-def fetch_dataloader(args, drop_last=True):
+def fetch_dataloader(args, training=True, drop_last=True):
     """ Create the data loader for the corresponding trainign set """
-
-    training = not args.eval_only
     if args.dataset == 'playroom':
         dataset = PlayroomDataset(training=training, args=args)
     else:

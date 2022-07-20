@@ -1,15 +1,11 @@
-from kornia.contrib import connected_components
+from cc_torch import connected_components_labeling
 import torch
-import pdb
-import matplotlib.pyplot as plt
-import time
 from core.utils.utils import reorder_int_labels
 
 def reorder_int_labels(x):
     _, y = torch.unique(x, return_inverse=True)
     y -= y.min()
     return y
-
 
 def label_connected_component(labels, min_area=20, topk=256):
     size = labels.size()
@@ -22,7 +18,7 @@ def label_connected_component(labels, min_area=20, topk=256):
 
     # label connected components
     # cc is an integer tensor, each unique id represents a single connected component
-    cc = connected_components(binary_masks.unsqueeze(1), num_iterations=500)  # [?, 1, H, W]
+    cc = torch.cat([connected_components_labeling(binary_masks[i].byte())[None] for i in range(binary_masks.shape[0])]).unsqueeze(1)
 
     # reorder indices in cc so that cc_area tensor below is a smaller
     cc = reorder_int_labels(cc)
@@ -37,6 +33,7 @@ def label_connected_component(labels, min_area=20, topk=256):
     else:
         _, selected_cc = torch.topk(cc_area, k=topk)
         valid = valid[selected_cc]
+
 
     # collapse the 0th dimension, since there is only matched one connected component (across 0th dimension)
     cc_mask = (cc == selected_cc.reshape(1, -1, 1, 1)).sum(0)  # [num_cc, H, W]
@@ -97,68 +94,5 @@ def filter_small_connected_component(labels, min_area=10, invalid_value=0):
         valid_labels = ~invalid_mask * labels + invalid_mask * invalid_value
 
     return valid_labels
-
-
-def aggregate_multiple_labels(pseudolabels, threshold=0.75, local_k=None):
-    """
-    :param pseudolabels: list of pseudolabels, each has shape [B, H, W]
-    :param threshold: confidence threshold of the affinities (averaged across runs)
-    :param local_k: if None, compute full affinity matrix. Otherwise, compute local affinity matrix
-    :return:
-    """
-    assert isinstance(pseudolabels, list)
-    B, N = pseudolabels[0].size()
-    num_runs = len(pseudolabels)
-
-    # 1. convert pseudolabels to affinity matrix and average across runs
-    # 2. create an intersection of the nonzero regions
-    #    for excluding the background regions (label 0) from the aggregation process
-    affinity_shape = [B, N, local_k ** 2 if local_k is not None else N]
-    aggregate_affinity = torch.zeros(affinity_shape).to(pseudolabels[0].device)
-    nonzero_masks = torch.ones([B, N]).to(pseudolabels[0])  # [B, H, W]
-    for p in pseudolabels:
-        nonzero_masks = torch.logical_and(nonzero_masks, p > 0) # [B, H, W]
-        affinity = (p.unsqueeze(-1) == p.unsqueeze(-2)).float() # TODO: handle local affinity
-        aggregate_affinity += affinity
-    affinity_nonzero_mask = nonzero_masks.unsqueeze(-1) * nonzero_masks.unsqueeze(-2)
-    aggregate_affinity = aggregate_affinity / num_runs
-
-    # a pair of affinity is confident if its average across runs is > threshold
-    confident_affinity = (aggregate_affinity * affinity_nonzero_mask) >= threshold
-
-    #  ----- visualization -----
-    assert B == 1
-    new_pseudo_labels = torch.zeros([B, N]).to(pseudolabels[0].device).long()
-    nzo = confident_affinity.sum(-1) > 0
-
-    count = 1
-    while nzo.sum() > 0:
-        argmax = nzo.float().argmax()
-
-        aff = confident_affinity[0, argmax,:]
-        nzo[0, aff] = 0.
-        print(nzo.sum())
-
-        new_pseudo_labels[0, aff] = count
-        count += 1
-
-    plt.figure(figsize=(15, 4))
-
-    for i, p in enumerate(pseudolabels):
-        plt.subplot(1, len(pseudolabels) + 1, i+1)
-        plt.imshow(p[0].reshape(32, 32).cpu())
-        plt.axis('off')
-        plt.title('Run %d' % i, fontsize=18)
-    plt.subplot(1, len(pseudolabels) + 1, i+2)
-    plt.imshow(new_pseudo_labels.reshape(32, 32).cpu())
-    plt.title('Final', fontsize=18)
-    plt.axis('off')
-
-    plt.show()
-    plt.close()
-    #  ----- end of visualization -----
-
-
-
 
 

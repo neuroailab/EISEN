@@ -38,38 +38,37 @@ class ResidualBlock(nn.Module):
                 self.norm3 = nn.Sequential()
 
         if stride == 1 and not downsample:
-            self.downsample = None
+            self.shortcut = None
 
         else:
-            self.downsample = nn.Sequential(
+            self.shortcut = nn.Sequential(
                 nn.Conv2d(in_planes, planes, kernel_size=1, stride=stride, bias=bias), self.norm3)
 
         self.residual = residual
 
     def forward(self, x):
-
         y = x
         y = self.relu(self.norm1(self.conv1(y)))
-        y = self.relu(self.norm2(self.conv2(y)))
+        y = self.norm2(self.conv2(y))
 
         if not self.residual:
             return y
 
-        if self.downsample is not None:
-            x = self.downsample(x)
+        if self.shortcut is not None:
+            x = self.shortcut(x)
 
         return self.relu(x+y)
 
 
 class KeyQueryProjection(nn.Module):
-    def __init__(self, input_dim, kq_dim, latent_dim, kernel_size=3, norm_fn='batch', downsample=False):
+    def __init__(self, input_dim, kq_dim, latent_dim, kernel_size=3, norm_fn='batch', downsample=True):
         super(KeyQueryProjection, self).__init__()
-        self.conv = nn.Conv2d(input_dim, kq_dim, kernel_size=kernel_size, bias=True, padding='same')
+        self.conv = nn.Conv2d(input_dim, kq_dim, kernel_size=1, bias=True, padding='same')
         self.key = nn.Sequential(
-            ResidualBlock(kq_dim, latent_dim, norm_fn, kernel_size=kernel_size, stride=1, residual=False, downsample=downsample),
+            ResidualBlock(kq_dim, latent_dim, norm_fn, kernel_size=kernel_size, bias=False, stride=1, residual=True, downsample=downsample),
             nn.Conv2d(latent_dim, kq_dim, kernel_size=1, bias=True, padding='same'))
         self.query = nn.Sequential(
-            ResidualBlock(kq_dim, latent_dim, norm_fn, kernel_size=kernel_size, stride=1, residual=False, downsample=downsample),
+            ResidualBlock(kq_dim, latent_dim, norm_fn, kernel_size=kernel_size, bias=False, stride=1, residual=True, downsample=downsample),
             nn.Conv2d(latent_dim, kq_dim, kernel_size=1, bias=True, padding='same'))
 
         for m in self.modules():

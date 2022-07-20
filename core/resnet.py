@@ -15,66 +15,10 @@ from detectron2.modeling.backbone.resnet import (
 )
 import numpy as np
 from detectron2.modeling.backbone.backbone import Backbone
-
+from detectron2.projects.deeplab import DeepLabV3PlusHead
+from detectron2.projects.deeplab.resnet import DeepLabStem
 import torch.nn as nn
 import torch
-
-
-class DeepLabStem(CNNBlockBase):
-    """
-    The DeepLab ResNet stem (layers before the first residual block).
-    """
-
-    def __init__(self, in_channels=3, out_channels=128, max_pool=True, norm="BN"):
-        """
-        Args:
-            norm (str or callable): norm after the first conv layer.
-                See :func:`layers.get_norm` for supported format.
-        """
-        super().__init__(in_channels, out_channels, 4)
-        self.in_channels = in_channels
-        self.conv1 = Conv2d(
-            in_channels,
-            out_channels // 2,
-            kernel_size=3,
-            stride=2,
-            padding=1,
-            bias=False,
-            norm=get_norm(norm, out_channels // 2),
-        )
-        self.conv2 = Conv2d(
-            out_channels // 2,
-            out_channels // 2,
-            kernel_size=3,
-            stride=1,
-            padding=1,
-            bias=False,
-            norm=get_norm(norm, out_channels // 2),
-        )
-        self.conv3 = Conv2d(
-            out_channels // 2,
-            out_channels,
-            kernel_size=3,
-            stride=1,
-            padding=1,
-            bias=False,
-            norm=get_norm(norm, out_channels),
-        )
-        weight_init.c2_msra_fill(self.conv1)
-        weight_init.c2_msra_fill(self.conv2)
-        weight_init.c2_msra_fill(self.conv3)
-        self.max_pool = max_pool
-
-    def forward(self, x):
-        x = self.conv1(x)
-        x = F.relu_(x)
-        x = self.conv2(x)
-        x = F.relu_(x)
-        x = self.conv3(x)
-        x = F.relu_(x)
-        if self.max_pool:
-            x = F.max_pool2d(x, kernel_size=3, stride=2, padding=1)
-        return x
 
 
 def build_resnet_deeplab_backbone(pool):
@@ -90,7 +34,7 @@ def build_resnet_deeplab_backbone(pool):
     norm                = 'BN'                      # cfg.MODEL.RESNETS.NORM
     stem_type           = 'deeplab'                     # cfg.MODEL.RESNETS.STEM_TYPE
     freeze_at           = 0                             # cfg.MODEL.BACKBONE.FREEZE_AT
-    out_features        = ['res2', 'res3', 'res4']      # cfg.MODEL.RESNETS.OUT_FEATURES
+    out_features        = ['res2', 'res3', 'res4', 'res5']      # cfg.MODEL.RESNETS.OUT_FEATURES
     depth               = 50                            # cfg.MODEL.RESNETS.DEPTH
     num_groups          = 1                             # cfg.MODEL.RESNETS.NUM_GROUPS
     width_per_group     = 64                            # cfg.MODEL.RESNETS.WIDTH_PER_GROUP
@@ -119,7 +63,6 @@ def build_resnet_deeplab_backbone(pool):
             in_channels=input_shape.channels,
             out_channels=in_channels,
             norm=norm,
-            max_pool=pool
         )
     else:
         raise ValueError("Unknown stem type: {}".format(stem_type))
@@ -453,3 +396,47 @@ class ResNetFPN(nn.Module):
 
         return feats
 
+class ResNet_Deeplab(DeepLabV3PlusHead):
+    def __init__(self):
+        input_shape = {'res2': ShapeSpec(channels=256, height=None, width=None, stride=4),
+                       'res3': ShapeSpec(channels=512, height=None, width=None, stride=8),
+                       'res5': ShapeSpec(channels=2048, height=None, width=None, stride=16)}
+
+        super().__init__(**self.from_config(input_shape))
+
+        # Backbone
+        self.backbone = build_resnet_deeplab_backbone(pool=True)
+        self.output_dim = 128
+
+    @classmethod
+    def from_config(cls, input_shape):
+        train_size = None
+        in_features = [ "res2", "res3", "res5" ]
+        project_features = ["res2", "res3"]
+        project_channels =  [32, 64]
+        aspp_channels =  256
+        aspp_dilations =  [6, 12, 18]
+        aspp_dropout = 0.1
+        head_channels = 32
+        convs_dim = 128
+        common_stride = 4
+        norm =  None
+        decoder_channels = [convs_dim] * (len(in_features) - 1) + [aspp_channels]
+        ret = dict(
+            input_shape={
+                k: v for k, v in input_shape.items() if k in in_features
+            },
+            project_channels=project_channels,
+            aspp_dilations=aspp_dilations,
+            aspp_dropout=aspp_dropout,
+            decoder_channels=decoder_channels,
+            common_stride=common_stride,
+            norm=norm,
+            train_size=train_size
+        )
+        return ret
+
+    def forward(self, x):
+        features = self.backbone(x)
+        features = super().layers(features)
+        return features

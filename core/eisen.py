@@ -6,13 +6,16 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 # from resnet import KeyQueryNetwork
-from core.resnet import ResNetFPN
+from core.resnet import ResNetFPN, ResNet_Deeplab
 from core.projection import KeyQueryProjection
 
 from core.competition import Competition
 from core.utils.connected_component import label_connected_component
-from core.raft import EvalRAFT
+from core.utils.segmentation_metrics import measure_static_segmentation_metric
 import core.utils.utils as utils
+import matplotlib.pyplot as plt
+from core.propagation import GraphPropagation
+import time
 
 class EISEN(nn.Module):
     def __init__(self,
@@ -23,34 +26,31 @@ class EISEN(nn.Module):
                  eval_full_affinity=False,
                  local_window_size=25,
                  num_affinity_samples=1024,
-                 propagation_iters=40,
+                 propagation_iters=25,
                  propagation_affinity_thresh=0.5,
                  num_masks=32,
-                 num_competition_rounds=3,
-                 sparse=False,
+                 num_competition_rounds=2,
                  stem_pool=True,
                  flow_threshold=0.5,
     ):
         super(EISEN, self).__init__()
 
         # [Backbone encoder]
-        self.backbone = ResNetFPN(min_level=2, max_level=4, pool=stem_pool)
+        self.backbone = ResNet_Deeplab()
         output_dim = self.backbone.output_dim
 
         # [Affinity decoder]
-        self.key_query_proj = KeyQueryProjection(input_dim=output_dim, kq_dim=kq_dim, latent_dim=latent_dim, downsample=False)
+        self.feat_conv = nn.Conv2d(output_dim, kq_dim, kernel_size=1, bias=True, padding='same')
+        self.key_proj = nn.Linear(kq_dim, kq_dim)
+        self.query_proj = nn.Linear(kq_dim, kq_dim)
 
         # [Affinity sampling]
         self.sample_affinity = subsample_affinity and (not (eval_full_affinity and (not self.training)))
         self.register_buffer('local_indices', utils.generate_local_indices(img_size=affinity_res, K=local_window_size))
 
         # [Propagation]
-        if sparse:
-            from core.propagation import GraphPropagation
-        else:
-            from core.static_propagation import GraphPropagation
         self.propagation = GraphPropagation(
-            num_iters=propagation_iters, adj_thresh=propagation_affinity_thresh, stop_gradient=False)
+            num_iters=propagation_iters, adj_thresh=propagation_affinity_thresh, stop_gradient=False, push=False, damp=False)
 
         # [Competition]
         self.competition = Competition(num_masks=num_masks, num_competition_rounds=num_competition_rounds)
@@ -58,20 +58,20 @@ class EISEN(nn.Module):
         self.local_window_size = local_window_size
         self.num_affinity_samples = num_affinity_samples
         self.affinity_res = affinity_res
-        self.sparse = sparse
         self.register_buffer("pixel_mean", torch.Tensor([123.675, 116.28, 103.53]).view(1, -1, 1, 1), False)
         self.register_buffer("pixel_std", torch.Tensor([58.395, 57.12, 57.375]).view(1, -1, 1, 1), False)
 
-    def forward(self, img, segment_target, get_segments=False):
+    def forward(self, input, segment_target, get_segments=False):
         """ build outputs at multiple levels"""
-
         # [Normalize inputs]
-        img = (img - self.pixel_mean) / self.pixel_std
+        img = (input['img1'] - self.pixel_mean) / self.pixel_std
 
         # [Backbone
         features = self.backbone(img)
         # Key & query projection
-        key, query = self.key_query_proj(features)
+        features = self.feat_conv(features).permute(0, 2, 3, 1) # [B, H, W, C]
+        key = self.key_proj(features).permute(0, 3, 1, 2) # [B, C, H, W]
+        query = self.query_proj(features).permute(0, 3, 1, 2) # [B, C, H, W]
         B, C, H, W = key.shape
 
         # Sampling affinities
@@ -84,11 +84,20 @@ class EISEN(nn.Module):
         # Compute affinity loss
         loss = self.compute_loss(affinity_logits, sample_inds, segment_target)
 
-        # Compute segments via propagation and competition
-        segments = self.compute_segments(affinity_logits, sample_inds) if get_segments else None
+        if get_segments:
+            # Compute segments via propagation and competition
+            segments = self.compute_segments(affinity_logits, sample_inds)
+            # Compute segment metrics
+            gt_segment = input['gt_segment']
+            seg_metric = {'metric_pred_segment_mean_ious': loss}
 
+            # seg_metric, seg_out = self.measure_segments(segments,  gt_segment)
+            # seg_metric = {k: v.to(loss.device) for k, v in seg_metric.items()} # tensor needs to be on GPU
+            # self.visualize_segments_all(segments, gt_segment[None], torch.zeros_like(gt_segment), input['img1'] / 255.)
 
-        return affinity_logits, loss, segments
+            return affinity_logits, loss, seg_metric, None
+        else:
+            return affinity_logits, loss, None, None
 
 
     def generate_affinity_sample_indices(self, size):
@@ -165,16 +174,17 @@ class EISEN(nn.Module):
 
         return loss
 
-    def compute_segments(self, logits, sample_inds, run_cc=True, hidden_dim=256):
+    def compute_segments(self, logits, sample_inds, run_cc=True, hidden_dim=32):
         B, N, K = logits.shape
+
         h0 = torch.cuda.FloatTensor(B, N, hidden_dim).normal_().softmax(-1) # h0
         adj = utils.softmax_max_norm(logits) # normalize affinities
 
-        if self.sparse:
-            adj = utils.local_to_sparse_global_affinity(adj, sample_inds, sparse_transpose=True) # sparse affinity matrix
+        # Convert affinity matrix to sparse tensor for memory efficiency
+        adj = utils.local_to_sparse_global_affinity(adj, sample_inds, sparse_transpose=True) # sparse affinity matrix
 
         # KP
-        hidden_states = self.propagation(h0.detach(), adj.detach(), sample_inds=sample_inds)
+        hidden_states, _, _ = self.propagation(h0.detach(), adj.detach())
         plateau = hidden_states[-1].reshape([B, self.affinity_res[0], self.affinity_res[1], hidden_dim])
 
         # Competition
@@ -190,6 +200,108 @@ class EISEN(nn.Module):
 
         return segments
 
+    def measure_segments(self, pred_segment, gt_segment):
+        return measure_static_segmentation_metric({'pred_segment': pred_segment}, {'gt_segment': gt_segment},
+                                                  pred_segment.shape[-2:],
+                                                  segment_key=['pred_segment'],
+                                                  moving_only=False,
+                                                  eval_full_res=True)
+
+    def visualize_segments_all(self, pred_segment, gt_segment, target, image, prefix=''):
+
+        H = W = 64
+
+        fsz = 19
+        num_plots = 4
+        fig = plt.figure(figsize=(num_plots * 4, 5))
+        gs = fig.add_gridspec(1, num_plots)
+        ax1 = fig.add_subplot(gs[0])
+
+        plt.imshow(image[0].permute([1, 2, 0]).cpu())
+        plt.axis('off')
+        ax1.set_title('Image', fontsize=fsz)
+
+        # labels = F.interpolate(batched_inputs[0]['gt_moving'].unsqueeze(0).float().cuda(), size=[H, W], mode='nearest')
+        ax = fig.add_subplot(gs[1])
+
+        if target is None:
+            target = torch.zeros(1, 1, H, W)
+        plt.imshow(target[0].cpu())
+        plt.title('Supervision', fontsize=fsz)
+        plt.axis('off')
+
+        ax = fig.add_subplot(gs[2])
+        plt.imshow(pred_segment[0].cpu(), cmap='twilight')
+        plt.title('Pred segments', fontsize=fsz)
+        plt.axis('off')
+
+        ax = fig.add_subplot(gs[3])
+        plt.imshow(gt_segment[0, 0].cpu(), cmap='twilight')
+        plt.title('GT segments', fontsize=fsz)
+        plt.axis('off')
+
+        # file_idx = batched_inputs[0]['file_name'].split('/')[-1].split('.hdf5')[0]
+        # save_path = os.path.join(self.vis_saved_path, 'step_%smask_%s_%s.png' % (prefix, 'eval' if iter is None else str(iter), file_idx))
+        # print('Save fig to ', save_path)
+        # plt.savefig(save_path, bbox_inches='tight')
+
+        plt.show()
+        plt.close()
+    def load_checkpoint(self):
+
+        ckpt_path = '/data3/honglinc/detectron_exp_log/TDW_128_RAFT_sintel0.5_b8_simple_aspp_nopos_nosym/model_0009999.pth'
+        state_dict = torch.load(ckpt_path)['model']
+        keys_list = list(state_dict.keys())
+        # breakpoint()
+        #
+        # for k,v in state_dict.items():
+        #     print(k, v.shape)
+        # print('------' * 10)
+        new_state_dict = self.state_dict()
+
+        #
+        # for k,v in new_state_dict.items():
+        #     print(k, v.shape)
+        # breakpoint()
+        for k, v in new_state_dict.items():
+            if 'backbone' in k:
+                new_k = 'net.student_encoders.f_single.' + k[9:]
+            elif 'key_proj' in k:
+                new_k = k.replace('key_proj', 'net.student_decoders.spatial_decoder.key')
+            elif 'query_proj' in k:
+                new_k = k.replace('query_proj', 'net.student_decoders.spatial_decoder.query')
+            elif 'feat_conv' in k:
+                new_k = k.replace('feat_conv', 'net.student_decoders.spatial_decoder.conv')
+                # if 'conv1' in k:
+                #     new_k = new_k.replace('conv1', 'blocks.0.blocks.0.0')
+                # elif 'norm1' in k:
+                #     new_k = new_k.replace('norm1', 'blocks.0.blocks.0.1')
+                # elif 'conv2' in k:
+                #     new_k = new_k.replace('conv2', 'blocks.0.blocks.2.0')
+                # elif 'norm2' in k:
+                #     new_k = new_k.replace('norm2', 'blocks.0.blocks.2.1')
+                # elif 'shortcut' in k:
+                #     new_k = new_k.replace('shortcut', 'blocks.0.shortcut')
+
+            else:
+                print('Skipping others: ', k)
+                continue
+
+            if new_k not in state_dict.keys():
+                print('Skipping unfound: ', k)
+
+                continue
+
+            new_state_dict[k] = state_dict[new_k]
+            print('*', k, '-->', new_k)
+            assert new_k in keys_list, pdb.set_trace()
+            keys_list.remove(new_k)
+
+
+        for k in keys_list:
+            print(k)
+
+        self.load_state_dict(new_state_dict)
 
 if __name__ == "__main__":
     x = torch.randn([1, 3, 512, 512]).cuda()
