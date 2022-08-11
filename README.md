@@ -38,6 +38,9 @@ You can evaluate a training model using the following command:
 python main.py --dataset playroom --barch_size 1 --eval_only --ckpt /path/to/checkpoint
 ```
 
+## TODO
+-[ ] Support for training on Bridge dataset (coming soon)
+
 ## Bibtex
 ```
 @article{chen2022unsupervised,
