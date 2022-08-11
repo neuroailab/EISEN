@@ -246,7 +246,7 @@ if __name__ == '__main__':
     parser.add_argument('--lr', type=float, default=5e-4)
     parser.add_argument('--clip_grad', type=float, default=1.0, help='gradient clipping value')
     parser.add_argument('--num_steps', type=int, default=100000)
-    parser.add_argument('--batch_size', type=int, default=6)
+    parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--affinity_size', type=int, nargs='+', default=[128, 128])
     parser.add_argument('--flow_threshold', type=float, default=0.5, help='binary threshold on raft dlows')
     parser.add_argument('--ckpt', type=str, help='path to restored checkpoint')
