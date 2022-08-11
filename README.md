@@ -8,7 +8,7 @@ This repository contains the official implementation for the paper "Unsupervised
 
 Paper: [https://arxiv.org/abs/2205.08515](https://arxiv.org/abs/2205.08515) \
 Project website: [https://neuroailab.github.io/eisen/](https://neuroailab.github.io/eisen/) \
-Author: Honglin Chen, Rahul Venkatesh, Yoni Friedman, Jiajun Wu, Joshua B. Tenenbaum, Daniel L. K. Yamins, Daniel M. Bear from Stanford University and MIT.\
+Authors: Honglin Chen, Rahul Venkatesh, Yoni Friedman, Jiajun Wu, Joshua B. Tenenbaum, Daniel L. K. Yamins, Daniel M. Bear from Stanford University and MIT.
 
 ## Environment
 We have tested our code using Pytorch 1.11 and CUDA 11.3. We recommend installation using Conda. Please make sure you have NVIDIA drivers supporting CUDA 11.3, or modify the version in `environment.yml. 
