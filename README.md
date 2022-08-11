@@ -39,7 +39,7 @@ python main.py --dataset playroom --barch_size 1 --eval_only --ckpt /path/to/che
 ```
 
 ## TODO
--[ ] Support for training on Bridge dataset (coming soon)
+- [ ] Support for training on Bridge dataset (coming soon)
 
 ## Bibtex
 ```
