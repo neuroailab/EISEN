@@ -1,4 +1,4 @@
-name: eisen2
+name: eisen
 channels:
   - pytorch
   - defaults
