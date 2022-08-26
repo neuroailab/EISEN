@@ -16,6 +16,8 @@ We have tested our code using Pytorch 1.11 and CUDA 11.3. We recommend installat
 ```
 conda env create -f environment.yml
 conda activate eisen
+# install external pip dependencies
+pip install -r requirements.txt
 ```
 
 ## Dataset
