@@ -1,0 +1,2 @@
+git+https://github.com/facebookresearch/Detectron2.git@v0.6
+git+https://github.com/zsef123/Connected_components_PyTorch
