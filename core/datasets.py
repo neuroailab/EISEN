@@ -14,7 +14,7 @@ import shutil
 import logging
 
 class PlayroomDataset(Dataset):
-    def __init__(self, training, args, frame_idx=5, dataset_dir = './datasets/Playroom'):
+    def __init__(self, training, args, frame_idx=0, dataset_dir = './datasets/Playroom'):
 
         self.training = training
         self.frame_idx = frame_idx
@@ -25,12 +25,12 @@ class PlayroomDataset(Dataset):
         self.meta = json.loads(Path(meta_path).open().read())
 
         if self.training:
-            self.file_list = glob.glob(os.path.join(dataset_dir, 'images', 'model_split_[0-9]*', '*[0-8]'))
+            self.file_list = glob.glob(os.path.join(dataset_dir, 'images', 'model_split_*', '*[0-8]'))
         else:
-            self.file_list = glob.glob(os.path.join(dataset_dir, 'images', 'model_split_[0-3]', '*9'))
+            self.file_list = sorted(glob.glob(os.path.join(dataset_dir, 'images', 'model_split_[0-3]', '*9')))
 
         if args.precompute_flow: # precompute flows for training and validation dataset
-            self.file_list = glob.glob(os.path.join(dataset_dir, 'images', 'model_split_[0-3]', '*9')) # glob.glob(os.path.join(dataset_dir, 'images', 'model_split_[0-9]*', '*[0-8]')) #+ \
+            self.file_list = glob.glob(os.path.join(dataset_dir, 'images', 'model_split_*', '*')) # glob.glob(os.path.join(dataset_dir, 'images', 'model_split_[0-9]*', '*[0-8]')) #+ \
 
 
     def __len__(self):
@@ -41,15 +41,17 @@ class PlayroomDataset(Dataset):
         frame_idx = self.frame_idx if os.path.exists(self.get_image_path(file_name, self.frame_idx)) else 0
         img1 = read_image(self.get_image_path(file_name, frame_idx))
 
+
         flag = os.path.exists(self.get_image_path(file_name, self.frame_idx+1))
         img2 = read_image(self.get_image_path(file_name, frame_idx+1)) if flag else img1
-        segment_colors = read_image(self.get_image_path(file_name.replace('/images/', '/objects/'), frame_idx))
+        segment_colors = read_image(self.get_image_path(file_name.replace('/images/', '/segments/'), frame_idx))
         gt_segment = self.process_segmentation_color(segment_colors, file_name)
 
         ret = {'img1': img1, 'img2': img2, 'gt_segment': gt_segment}
 
         if not self.args.compute_flow and not self.args.precompute_flow:
-            flow = np.load(os.path.join(file_name, 'flow_'+format(frame_idx, '05d') + '.npy'))
+            flow_path = os.path.join(file_name.replace('/images/', '/flows/'), f'frame{frame_idx}.npy')
+            flow = np.load(flow_path)
             magnitude = torch.tensor((flow ** 2).sum(0, keepdims=True) ** 0.5)
             segment_target = (magnitude > self.args.flow_threshold)
             ret['segment_target'] = segment_target
@@ -60,7 +62,7 @@ class PlayroomDataset(Dataset):
 
     @staticmethod
     def get_image_path(file_name, frame_idx):
-        return os.path.join(file_name, format(frame_idx, '05d') + '.png')
+        return os.path.join(file_name, f'frame{frame_idx}' + '.png')
 
     @staticmethod
     def _object_id_hash(objects, val=256, dtype=torch.long):
@@ -103,7 +105,7 @@ def fetch_dataloader(args, training=True, drop_last=True):
                             num_workers=args.num_workers,
                             drop_last=drop_last)
 
-    logging.info(f'Load dataset [{args.dataset}] with {len(dataset)} image pairs')
+    logging.info(f"Load dataset [{args.dataset}-{'train' if training else 'val'}] with {len(dataset)} image pairs")
     return dataloader
 
 

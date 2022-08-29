@@ -72,7 +72,7 @@ def bilinear_sampler(img, coords, mode='bilinear', mask=False):
 
 
 def coords_grid(batch, ht, wd, device):
-    coords = torch.meshgrid(torch.arange(ht, device=device), torch.arange(wd, device=device))
+    coords = torch.meshgrid(torch.arange(ht, device=device), torch.arange(wd, device=device), indexing='ij')
     coords = torch.stack(coords[::-1], dim=0).float()
     return coords[None].repeat(batch, 1, 1, 1)
 
@@ -165,6 +165,9 @@ def local_to_sparse_global_affinity(local_adj, sample_inds, activated=None, spar
 
     B, N, K = list(local_adj.shape)
 
+    if sample_inds is None:
+        return local_adj
+
     assert sample_inds.shape[0] == 3
     local_node_inds = sample_inds[2] # [B, N, K]
 
@@ -190,6 +193,14 @@ def local_to_sparse_global_affinity(local_adj, sample_inds, activated=None, spar
         raise ValueError('Current KP implementation assumes tranposed affinities')
 
     return global_adj
+
+def downsample_tensor(x, stride):
+    # x should have shape [B, C, H, W]
+    if stride == 1:
+        return x
+    B, C, H, W = x.shape
+    x = F.unfold(x, kernel_size=1, stride=stride)  # [B, C, H / stride * W / stride]
+    return x.reshape([B, C, int(H / stride), int(W / stride)])
 
 
 def kl_divergence(logits, labels, logits_mode='log_softmax', labels_mode='row_sum', reduce_sum=True, label_smoothing=False):

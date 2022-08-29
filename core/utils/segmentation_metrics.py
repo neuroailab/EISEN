@@ -10,28 +10,48 @@ from torchvision import transforms
 import torch.nn.functional as F
 import pdb
 
-def object_id_hash(objects, dtype_out=torch.int32, val=256, channels_last=False):
-    '''
-    objects: [...,C]
-    val: a number castable to dtype_out
-    returns:
-    out: [...,1] where each value is given by sum([val**(C-1-c) * objects[...,c:c+1] for c in range(C)])
-    '''
-    if not isinstance(objects, torch.Tensor):
-        objects = torch.tensor(objects)
-    if not channels_last:
-        objects = objects.permute(0,2,3,1)
-    C = objects.shape[-1]
-    val = torch.tensor(val, dtype=dtype_out)
-    objects = objects.to(dtype_out)
-    out = torch.zeros_like(objects[...,0:1])
-    for c in range(C):
-        scale = torch.pow(val, C-1-c)
-        out += scale * objects[...,c:c+1]
-    if not channels_last:
-        out = out.permute(0,3,1,2)
+def measure_static_segmentation_metric(out, inputs, size, segment_key,
+                                       eval_full_res=False, exclude_pred_ids=None, gt_seg=None):
 
-    return out
+    if gt_seg is not None:
+        gt_objects = gt_seg.int()
+    else:
+        gt_objects = inputs['gt_segment'].int()
+    assert gt_objects.max() < torch.iinfo(torch.int32).max, gt_objects
+    if not eval_full_res:
+        gt_objects = F.interpolate(gt_objects.float().unsqueeze(1), size=size, mode='nearest').int()
+
+    exclude_values = []
+    if not isinstance(segment_key, list):
+        segment_key = [segment_key]
+
+    segment_metric = {}
+    segment_out = {}
+    for key in segment_key:
+        results = {'mean_ious': [], 'recalls': [], 'boundary_f1_scores': []}
+        pred_objects = out[key]
+        pred_objects = pred_objects.reshape(pred_objects.shape[0], 1, size[0], size[1])
+
+        metric = SegmentationMetrics(gt_objects=gt_objects.cpu(),
+                                     pred_objects=pred_objects.int().cpu(),
+                                     size=None if eval_full_res else size,
+                                     background_value=0,
+                                     exclude_pred_ids=exclude_pred_ids)
+
+        metric.compute_matched_IoUs(exclude_gt_ids=list(set([0] + exclude_values)))
+        # metric.compute_recalls()
+        # metric.compute_boundary_f_measures(exclude_gt_ids=list(set([0] + exclude_values)))
+
+        results['mean_ious'].append(metric.mean_ious)
+        # results['recalls'].append(metric.recalls)
+        # results['boundary_f1_scores'].append(metric.mean_boundary_f1_scores)
+
+        for k, v in results.items():
+            segment_metric[f'metric_{key}_{k}'] = torch.tensor(np.mean(v))
+        segment_out[key] = metric.seg_out
+
+    return segment_metric, segment_out
+
 
 class SegmentationMetrics(object):
     """
@@ -304,24 +324,6 @@ class SegmentationMetrics(object):
 
             num_preds = len(preds)
 
-            # # ---- visualize ----
-            # import pdb;pdb.set_trace()
-            # import matplotlib.pyplot as plt
-            # plt.figure(figsize=(20, 5))
-            # for i in range(num_preds):
-            #     plt.subplot(1, num_preds, i+1)
-            #     plt.imshow(preds[i])
-            #     plt.title('Pred %d' % i)
-            # plt.show()
-            # plt.close()
-            # plt.figure(figsize=(20, 5))
-            # for i in range(num_gt):
-            #     plt.subplot(1, num_gt, i+1)
-            #     plt.imshow(self.get_gt_mask(ex, t, ids_here[i]))
-            #     plt.title('GT %d' % i)
-            # plt.show()
-            # plt.close()
-
             # compute full matrix of ious
             gts = []
             ious = np.zeros((num_gt, num_preds), dtype=np.float32)
@@ -356,26 +358,6 @@ class SegmentationMetrics(object):
 
                 matched_pred.append(np.zeros_like(preds[0]))
             matched_preds.append(matched_pred)
-            # # # # ---- visualize ----
-            # import pdb;pdb.set_trace()
-            # import matplotlib.pyplot as plt
-            # plt.figure(figsize=(20, 5))
-            # for i in range(len(matched_preds[0])):
-            #     plt.subplot(1, len(matched_preds[0]), i+1)
-            #     plt.imshow(matched_preds[0][i])
-            #     plt.title('Pred %d' % i)
-            # plt.show()
-            # plt.close()
-            # plt.figure(figsize=(20, 5))
-            # for i in range(len(matched_preds[0])):
-            #     plt.subplot(1, len(matched_preds[0]), i+1)
-            #     plt.imshow(matched_gts[0][i])
-            #     plt.title('GT %d' % i)
-            # plt.show()
-            # plt.close()
-            # print(best_IoUs, best[gt_inds])
-            #
-            # pdb.set_trace()
 
         self.best_ious = best_IoUs
         self.best_object_ids = best_pred_objs
@@ -493,106 +475,29 @@ class SegmentationMetrics(object):
             raise ValueError("You need to compute boundary_f_measure")
         self._mean_boundary_f1_scores = value
 
+def object_id_hash(objects, dtype_out=torch.int32, val=256, channels_last=False):
+    '''
+    objects: [...,C]
+    val: a number castable to dtype_out
+    returns:
+    out: [...,1] where each value is given by sum([val**(C-1-c) * objects[...,c:c+1] for c in range(C)])
+    '''
+    if not isinstance(objects, torch.Tensor):
+        objects = torch.tensor(objects)
+    if not channels_last:
+        objects = objects.permute(0,2,3,1)
+    C = objects.shape[-1]
+    val = torch.tensor(val, dtype=dtype_out)
+    objects = objects.to(dtype_out)
+    out = torch.zeros_like(objects[...,0:1])
+    for c in range(C):
+        scale = torch.pow(val, C-1-c)
+        out += scale * objects[...,c:c+1]
+    if not channels_last:
+        out = out.permute(0,3,1,2)
 
-def measure_static_segmentation_metric(out, inputs, size, segment_key,
-                                       eval_full_res=False, moving_only=True, exclude_zone=True,
-                                       exclude_pred_ids=None, gt_seg=None):
-
-    if gt_seg is not None:
-        gt_objects = gt_seg.int()
-    else:
-        gt_objects = inputs['gt_segment'].int()
-    assert gt_objects.max() < torch.iinfo(torch.int32).max, gt_objects
-    if not eval_full_res:
-        gt_objects = F.interpolate(gt_objects.float().unsqueeze(1), size=size, mode='nearest').int()
-
-    exclude_values = []
-    if not isinstance(segment_key, list):
-        segment_key = [segment_key]
-
-    segment_metric = {}
-    segment_out = {}
-    for key in segment_key:
-        results = {'mean_ious': [], 'recalls': [], 'boundary_f1_scores': []}
-        pred_objects = out[key]
-        pred_objects = pred_objects.reshape(pred_objects.shape[0], 1, size[0], size[1])
-
-        metric = SegmentationMetrics(gt_objects=gt_objects.cpu(),
-                                     pred_objects=pred_objects.int().cpu(),
-                                     size=None if eval_full_res else size,
-                                     background_value=0,
-                                     exclude_pred_ids=exclude_pred_ids)
-
-        metric.compute_matched_IoUs(exclude_gt_ids=list(set([0] + exclude_values)))
-        # metric.compute_recalls()
-        # metric.compute_boundary_f_measures(exclude_gt_ids=list(set([0] + exclude_values)))
-
-        results['mean_ious'].append(metric.mean_ious)
-        # results['recalls'].append(metric.recalls)
-        # results['boundary_f1_scores'].append(metric.mean_boundary_f1_scores)
-
-        for k, v in results.items():
-            segment_metric[f'metric_{key}_{k}'] = torch.tensor(np.mean(v))
-        segment_out[key] = metric.seg_out
-
-    return segment_metric, segment_out
-
-
-
-def four_quadrant_segments(size=[128,128], separator=[0.5, 0.5], minval=1, maxval=32):
-    H,W = size
-    h1 = int(H * separator[0])
-    h2 = H-h1
-    w1 = int(W * separator[1])
-    w2 = W-w1
-
-    vals = torch.randint(size=[4], low=minval, high=maxval, dtype=torch.int32)
-    q1 = torch.ones([h1,w1]).to(vals) * vals[0]
-    q2 = torch.ones([h1,w2]).to(vals) * vals[1]
-    q3 = torch.ones([h2,w2]).to(vals) * vals[2]
-    q4 = torch.ones([h2,w1]).to(vals) * vals[3]
-    top = torch.cat([q2, q1], dim=1)
-    bottom = torch.cat([q3,q4], dim=1)
-    out = torch.cat([top,bottom], dim=0)[None]
     return out
 
 if __name__ == '__main__':
-    size = [128,128]
-    # gt_objects = torch.randint(size=(4,2,3,32,32), low=0, high=255, dtype=torch.uint8)
-    # gt_objects = torch.randint(size=(4,2,1,32,32), low=0, high=8, dtype=torch.int32)
-    # pred_objects = torch.randint(size=(4,2,16,16), low=0, high=32, dtype=torch.int32)
-    gt_objects = four_quadrant_segments(size, separator=[0.3,0.6])
-    Metrics = SegmentationMetrics(gt_objects, pred_objects=gt_objects, size=size)
-    print("gt", Metrics.gt_objects.shape, Metrics.gt_objects.dtype)
-    print("pred", Metrics.pred_objects.shape, Metrics.pred_objects.dtype)
-    print("B, T, size", Metrics.B, Metrics.T, Metrics.size)
-
-    Metrics.compute_matched_IoUs()
-    print("Best ious", Metrics.best_ious)
-    print("Best objects", Metrics.best_object_ids)
-
-    Metrics.compute_recalls()
-    print("recall", Metrics.recalls)
-
-    # Metrics.compute_matched_IoUs(gt_objects)
-    # print("Best ious", Metrics.best_ious)
-    # print("Best objects", Metrics.best_object_ids)
-
-    # Metrics.compute_recalls()
-    # print("recall", Metrics.recalls)
-
-    print("mean ious", Metrics.mean_ious)
-    Metrics.compute_boundary_f_measures()
-    print("boundary f1", Metrics.boundary_f1_scores)
-    print("boundary f1", Metrics.mean_boundary_f1_scores)
-
-    # print("mask precision", Metrics.mask_precision(Metrics.pred_objects[0] == Metrics.gt_ids[0][0], Metrics.gt_objects[0] == Metrics.gt_ids[0][0]))
-    # print("mask recall", Metrics.mask_recall(Metrics.pred_objects[0] == Metrics.gt_ids[0][0], Metrics.gt_objects[0] == Metrics.gt_ids[0][0]))
-
-    Metrics.compute_matched_IoUs(metric='precision')
-    print("Mask precision", Metrics.best_ious)
-
-    Metrics.compute_matched_IoUs(metric='recall')
-    print("Mask recall", Metrics.best_ious)    
-    
+    pass
     

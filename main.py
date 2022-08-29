@@ -1,8 +1,6 @@
 from __future__ import print_function, division
-
 import pdb
 import sys
-
 import argparse
 import os
 import cv2
@@ -10,52 +8,59 @@ import time
 import numpy as np
 import matplotlib.pyplot as plt
 import datetime
+import warnings
+warnings.filterwarnings("ignore")
 import logging
 logging.basicConfig(format='%(asctime)s - %(message)s', level=logging.INFO)
-
 import torch
 import torch.nn as nn
 from core.datasets import fetch_dataloader
-
 from core.eisen import EISEN
 from core.optimizer import fetch_optimizer
 from core.raft import EvalRAFT
 import core.utils.sync_batchnorm as sync_batchnorm
-
-
-
 num_gpus = torch.cuda.device_count()
+
 def train(args):
     total_steps = 0
-    train_loader = fetch_dataloader(args)
-    model = nn.DataParallel(EISEN())
-    model = sync_batchnorm.convert_model(model)
-    raft_model = EvalRAFT(flow_threshold=args.flow_threshold)
 
+    ## Prepare dataloader
+    train_loader = fetch_dataloader(args)
+    val_loader = fetch_dataloader(args, training=False, drop_last=False)
+
+    ## Prepare model and optimizer
+    model = nn.DataParallel(EISEN())
+    model = sync_batchnorm.convert_model(model) # synchronize batchnorm statistics around multiple GPUs
+    # initialize RAFT model for computing optical flows, if they are not precomputed
+    raft_model = EvalRAFT(flow_threshold=args.flow_threshold) if args.compute_flow else None
     optimizer, scheduler = fetch_optimizer(args, model)
 
+    ## Load checkpoint if checkpoint path is specified
     if args.ckpt is not None:
-        model.load_state_dict(torch.load(args.ckpt))
+        state_dict = torch.load(args.ckpt)
+        model.load_state_dict(state_dict)
         total_steps = int(args.ckpt.split('_')[-1].split('.pth')[0]) + 1
         logging.info(f'Restore checkpoint from {args.ckpt}')
 
-    model.cuda() # fixme: change it to the device of the first args.gpus
+    model.cuda()
     model.train()
     logging.info(f"Parameter Count: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
     assert args.batch_size % num_gpus == 0, \
             f"Batch size should be divisible by #gpus, but got batch size {args.batch_size} and {num_gpus} gpus"
 
-    if args.wandb:
+    if args.wandb: # Log training and validation curves using wandb
         import wandb
-        wandb.init(project="detectron", name=args.name, settings=wandb.Settings(start_method="fork"))
+        wandb.init(project="eisen", name=args.name, settings=wandb.Settings(start_method="fork"))
 
+    ## Start training
     end = time.time()
     while total_steps < args.num_steps:
         for i_batch, data_dict in enumerate(train_loader):
             data_time = time.time() - end
             optimizer.zero_grad()
-            data_dict = {k: v.cuda() for k, v in data_dict.items() if k in ['img1', 'segment_target']}
+            data_dict = {k: v.cuda() for k, v in data_dict.items() if k in ['img1', 'img2', 'segment_target']}
 
+            # Compute motion segmentation for affinity supervision
             if args.compute_flow:
                 with torch.no_grad():
                     _, _, segment_target = raft_model(data_dict['img1'], data_dict['img2'])
@@ -76,6 +81,7 @@ def train(args):
             optimizer.step()
             scheduler.step()
 
+            # log training losses and time
             if (total_steps+ 1) % args.print_freq == 0:
                 logging.info(f"[train] iter: {total_steps}  loss: {loss:.3f}  data_time: {data_time:.4f}  raft_time: {raft_time:.4f}, step_time: {step_time:.3f}  " \
                       f"eta: {str(datetime.timedelta(seconds=eta))}  " \
@@ -83,20 +89,20 @@ def train(args):
                 if args.wandb:
                     wandb.log({'loss': loss, 'data_time': data_time, 'step_time': step_time, 'lr': optimizer.param_groups[0]['lr']}, step=total_steps)
 
+            # run validation
             if (total_steps + 1) % args.val_freq == 0:
                 ckpt_path = f'checkpoints/{args.name}/ckpt_{total_steps}.pth'
                 torch.save(model.state_dict(), ckpt_path)
                 logging.info(f'Save checkpoint to {ckpt_path}')
+                avg_miou, avg_loss = evaluate_helper(args, val_loader, model, raft_model)
+                if args.wandb:
+                    wandb.log({'val_miou': avg_miou}, step=total_steps)
+                model.train()
 
-                # avg_miou, avg_loss = evaluate(args)
-                # if args.wandb:
-                #     wandb.log({'val_loss': avg_loss, 'val_miou': avg_miou}, step=total_steps)
-                #
-                # model.train()
             total_steps += 1
             end = time.time()
 
-    # saving final checkpoint
+    ## Saving final checkpoint
     torch.save(model.state_dict(), f'checkpoints/{args.name}/ckpt_final.pth')
 
 
@@ -107,7 +113,8 @@ def evaluate(args):
     raft_model = EvalRAFT(flow_threshold=args.flow_threshold) if args.compute_flow else None
 
     if args.ckpt is not None:
-        model.load_state_dict(torch.load(args.ckpt))
+        state_dict = torch.load(args.ckpt)
+        model.load_state_dict(state_dict)
         logging.info(f'Restore checkpoint from {args.ckpt}')
     else:
         logging.warning('Warning: continue evaluation without loading pretrained checkpoints')
@@ -115,22 +122,16 @@ def evaluate(args):
     model.cuda()
     logging.info(f"Parameter Count: {sum(p.numel() for p in model.parameters() if p.requires_grad)}")
     assert args.batch_size / num_gpus == 1, \
-            f"Effective Batch size should be 1, but got batch size {args.batch_size} and {num_gpus} gpus"
+            f"Effective Batch size for evaluation should be 1, but got batch size {args.batch_size} and {num_gpus} gpus"
 
     avg_miou, avg_loss = evaluate_helper(args, val_loader, model, raft_model=raft_model)
     return avg_miou, avg_loss
 
 
 def evaluate_helper(args, dataloader, model, raft_model=None):
-    # print('!!!!!!!!!!!! warning: loading checkpoint' * 20)
-    # model.module.load_checkpoint()
-
-    model = model.cuda()
     model.eval()
     end = time.time()
-    miou_list = []
-    loss_list = []
-    time_list = []
+    miou_list, loss_list, time_list = [], [], []
 
     for step, data_dict in enumerate(dataloader):
         start = time.time()
@@ -138,9 +139,8 @@ def evaluate_helper(args, dataloader, model, raft_model=None):
         data_dict = {k: v.cuda() for k, v in data_dict.items() if not k == 'file_name'}
 
         bs = data_dict['img1'].shape[0]
-        if bs < args.batch_size:  # add padding if bs is smaller than batch size
+        if bs < args.batch_size:  # add padding if bs is smaller than batch size (required since drop_last is set to False)
             pad_size = args.batch_size - bs
-
             for key in data_dict.keys():
                 padding = torch.cat([torch.zeros_like(data_dict[key][0:1])] * pad_size, dim=0)
                 data_dict[key] = torch.cat([data_dict[key], padding], dim=0)
@@ -152,8 +152,8 @@ def evaluate_helper(args, dataloader, model, raft_model=None):
             segment_target = data_dict['segment_target']
 
         raft_time = time.time() - end
-        _, loss, metric, segment = model(data_dict, segment_target.detach(), get_segments=True)
-
+        _, loss, metric, segment = model(data_dict, segment_target.detach(),
+                                         get_segments=True, vis_segments=(args.visualize and args.eval_only))
         mious = metric['metric_pred_segment_mean_ious']
 
         step_time = time.time() - end
@@ -166,19 +166,22 @@ def evaluate_helper(args, dataloader, model, raft_model=None):
             loss_list.extend([l.item() for l in list(loss)][0:bs])
             miou_list.extend([miou.item() for miou in list(mious)][0:bs])
 
-        avg_miou = np.nanmean(miou_list)
-        avg_loss = np.nanmean(loss_list)
-        logging.info(f"[val] iter: {step} avg_miou: {avg_miou:.3f} avg_loss: {avg_loss:.3f}  " \
-                     f"data_time: {data_time:.4f}  raft_time: {raft_time:.3f} step_time: {step_time:.3f}  " \
-                     f"eta: {str(datetime.timedelta(seconds=eta))}")
+        if (step + 1) % 10 == 0 or (step + 1) == len(dataloader):
+            avg_miou = np.nanmean(miou_list)
+            avg_loss = np.nanmean(loss_list)
+            logging.info(f"[val] iter: {step} avg_miou: {avg_miou:.3f} avg_loss: {avg_loss:.3f}  " \
+                         f"data_time: {data_time:.4f}  raft_time: {raft_time:.3f} step_time: {step_time:.3f}  " \
+                         f"eta: {str(datetime.timedelta(seconds=eta))}")
         end = time.time()
         time_list.append(end-start)
 
-    avg_time = np.mean(time_list[5:-1]) # the first 5 iterations are warmup
-
-    print(f'Num. imgs: {len(miou_list)}')
-    print(f'Avg. mIoU: {avg_miou:.3f}')
-    print(f'Avg. time: {avg_time:.3f}')
+    print('+--------------------+')
+    print('| Validation summary |')
+    print('+--------------------+')
+    print(f'| Num. Imgs |  {len(miou_list)}   |')
+    print(f'| Avg. mIoU |  {np.nanmean(miou_list):.3f} |')
+    print(f'| Avg. time |  {np.mean(time_list[5:]):.3f} |') # the first 5 iterations are discarded
+    print('+--------------------+')
     return avg_miou, avg_loss
 
 def precompute_flows(args):
@@ -215,8 +218,10 @@ def precompute_flows(args):
             for i, name in enumerate(file_name):
                 if i < bs:
                     flow_uv = flow[i].cpu().numpy()
-                    image_name = name.split('/')[-1]
-                    np.save(name.replace(image_name, 'flow_'+image_name).replace('png', 'npy'), flow_uv)
+                    save_path = name.replace('/images/', '/flows/').replace('png', 'npy')
+                    if not os.path.isdir(os.path.dirname(save_path)):
+                        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+                    np.save(save_path, flow_uv)
 
         step_time = time.time() - end
         eta = int((len(train_loader) - step) * step_time)
@@ -240,12 +245,12 @@ if __name__ == '__main__':
     parser.add_argument('--dataset', default="playroom", help="determines which dataset to use for training")
 
     # dataloader
-    parser.add_argument('--num_workers', type=int, default=8)
+    parser.add_argument('--num_workers', type=int, default=16)
 
     # training
     parser.add_argument('--lr', type=float, default=5e-4)
     parser.add_argument('--clip_grad', type=float, default=1.0, help='gradient clipping value')
-    parser.add_argument('--num_steps', type=int, default=100000)
+    parser.add_argument('--num_steps', type=int, default=200000)
     parser.add_argument('--batch_size', type=int, default=8)
     parser.add_argument('--affinity_size', type=int, nargs='+', default=[128, 128])
     parser.add_argument('--flow_threshold', type=float, default=0.5, help='binary threshold on raft dlows')
@@ -254,6 +259,7 @@ if __name__ == '__main__':
     # evaluation
     parser.add_argument('--eval_only', action='store_true')
     parser.add_argument('--val_freq', type=int, default=5000, help='validation and checkpoint frequency')
+    parser.add_argument('--visualize', action='store_true', help='visualize segments')
 
     # logging
     parser.add_argument('--print_freq', type=int, default=100, help='frequency for printing loss')

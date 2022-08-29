@@ -11,14 +11,259 @@ from kornia.filters.kernels import (get_spatial_gradient_kernel2d,
 import time
 import sys
 
-# from .panoptic_seg import kl_divergence
-
 def l2_normalize(x):
     return F.normalize(x, p=2.0, dim=-1, eps=1e-6)
 
 
 def reduce_max(x, dim, keepdim=True):
     return torch.max(x, dim=dim, keepdim=keepdim)[0]
+
+
+class Competition(nn.Module):
+
+    def __init__(
+            self,
+            size=None,
+            num_masks=16,
+            num_competition_rounds=5,
+            mask_beta=10.0,
+            reduce_func=reduce_max,
+            stop_gradient=True,
+            stop_gradient_phenotypes=True,
+            normalization_func=l2_normalize,
+            sum_edges=True,
+            mask_thresh=0.5,
+            compete_thresh=0.2,
+            sticky_winners=True,
+            selection_strength=100.0,
+            homing_strength=10.0,
+            mask_dead_segments=True
+    ):
+        super().__init__()
+        self.num_masks = self.M = num_masks
+        self.num_competition_rounds = num_competition_rounds
+        self.mask_beta = mask_beta
+        self.reduce_func = reduce_func
+        self.normalization_func = normalization_func
+
+        ## stop gradients
+        self.sg_func = lambda x: (x.detach() if stop_gradient else x)
+        self.sg_phenotypes_func = lambda x: (x.detach() if stop_gradient_phenotypes else x)
+
+        ## agent sampling kwargs
+        self.sum_edges = sum_edges
+
+        ## competition kwargs
+        self.mask_thresh = mask_thresh
+        self.compete_thresh = compete_thresh
+        self.sticky_winners = sticky_winners
+        self.selection_strength = selection_strength
+        self.homing_strength = homing_strength
+        self.mask_dead_segments = mask_dead_segments
+
+        ## shapes
+        self.B = self.T = self.BT = self.N = self.Q = None
+        self.size = size  # [H,W]
+        if self.size:
+            assert len(self.size) == 2, self.size
+
+    def reshape_batch_time(self, x, merge=True):
+
+        if merge:
+            self.is_temporal = True
+            B, T = x.size()[0:2]
+            if self.B:
+                assert (B == self.B), (B, self.B)
+            else:
+                self.B = B
+
+            if self.T:
+                assert (T == self.T), (T, self.T)
+            else:
+                self.T = T
+
+            assert B * T == (self.B * self.T), (B * T, self.B * self.T)
+            if self.BT is None:
+                self.BT = self.B * self.T
+
+            return torch.reshape(x, [self.BT] + list(x.size())[2:])
+
+        else:  # split
+            BT = x.size()[0]
+            assert self.B and self.T, (self.B, self.T)
+            if self.BT is not None:
+                assert BT == self.BT, (BT, self.BT)
+            else:
+                self.BT = BT
+
+            return torch.reshape(x, [self.B, self.T] + list(x.size())[1:])
+
+    def process_plateau_input(self, plateau):
+
+        shape = plateau.size()
+        if len(shape) == 5:
+            self.is_temporal = True
+            self.B, self.T, self.H, self.W, self.Q = shape
+            self.N = self.H * self.W
+            self.BT = self.B * self.T
+            plateau = self.reshape_batch_time(plateau)
+        elif (len(shape) == 4) and (self.size is None):
+            self.is_temporal = False
+            self.B, self.H, self.W, self.Q = shape
+            self.N = self.H * self.W
+            self.T = 1
+            self.BT = self.B * self.T
+        elif (len(shape) == 4) and (self.size is not None):
+            self.is_temporal = True
+            self.B, self.T, self.N, self.Q = shape
+            self.BT = self.B * self.T
+            self.H, self.W = self.size
+            plateau = self.reshape_batch_time(plateau)
+            plateau = torch.reshape(plateau, [self.BT, self.H, self.W, self.Q])
+        elif len(shape) == 3:
+            assert self.size is not None, \
+                "You need to specify an image size to reshape the plateau of shape %s" % shape
+            self.is_temporal = False
+            self.B, self.N, self.Q = shape
+            self.T = 1
+            self.BT = self.B
+            self.H, self.W = self.size
+            plateau = torch.reshape(plateau, [self.BT, self.H, self.W, self.Q])
+        else:
+            raise ValueError("input plateau map with shape %s cannot be reshaped to [BT, H, W, Q]" % shape)
+
+        return plateau
+
+    def forward(self, plateau):
+        """
+        Find the uniform regions within the plateau map
+        by competition between visual "indices."
+
+        args:
+            plateau: [B,[T],H,W,Q] feature map with smooth "plateaus"
+
+        returns:
+            masks: [B, [T], H, W, M] <float> one mask in each of M channels
+            agents: [B, [T], M, 2] <float> positions of agents in normalized coordinates
+            alive: [B, [T], M] <float> binary vector indicating which masks are valid
+            phenotypes: [B, [T], M, Q]
+            unharvested: [B, [T], H, W] <float> map of regions that weren't covered
+
+        """
+
+        ## preprocess
+        plateau = self.process_plateau_input(plateau)  # [BT,H,W,Q]
+        plateau = self.normalization_func(plateau)
+
+        ## sample initial indices ("agents") from borders of the plateau map
+        agents = sample_coordinates_at_borders(
+            plateau.permute(0, 3, 1, 2), num_points=self.M, mask=None, sum_edges=self.sum_edges)
+
+        ## initially all of these agents are "alive"
+        alive = torch.ones_like(agents[..., -1:])  # [BT,M,1]
+
+        ## the agents have "phenotypes" depending on where they're situated on the plateau map
+        phenotypes = self.sg_phenotypes_func(
+            self.normalization_func(soft_index(plateau.permute(0, 3, 1, 2), agents, scale_by_imsize=True)))
+
+        ## the "fitness" of an agent -- how likely it is to survive competition --
+        ## is how well its phenotype matches the plateau vector at its current position
+        fitnesses = compute_compatibility(agents, plateau, phenotypes, availability=None, noise=0.1)
+
+        ## compute the masks at initialization
+        masks_pred = masks_from_phenotypes(plateau, phenotypes, normalize=True)
+
+        ## find the "unharvested" regions of the plateau map not covered by agents
+        unharvested = torch.minimum(self.reduce_func(masks_pred, dim=-1, keepdim=True),
+                                    torch.tensor(1.0).to(masks_pred))
+        unharvested = 1.0 - unharvested.view(self.BT, self.H, self.W, 1)
+
+        for r in range(self.num_competition_rounds):
+            # print("Evolution round {}".format(r + 1))
+
+            ## compute the "availability" of the plateau map for each agent (i.e. where it can harvest from)
+            alive_t = torch.transpose(alive, 1, 2)  # [BT, 1, M]
+            availability = alive_t * masks_pred + (1.0 - alive_t) * unharvested.view(self.BT, self.N, 1)
+            availability = availability.view(self.BT, self.H, self.W, self.M)
+
+            ## update the fitnesses
+            fitnesses = compute_compatibility(
+                positions=agents,
+                plateau=plateau,
+                phenotypes=phenotypes,
+                availability=availability)
+
+            ## kill agents that have wandered off the map
+            in_bounds = torch.all(
+                torch.logical_and(agents < 1.0, agents > -1.0),
+                dim=-1, keepdim=True)  # [BT,M,1]
+            fitnesses *= in_bounds.to(fitnesses)
+
+            ## break ties in fitness
+            fitnesses -= 0.001 * torch.arange(self.M, dtype=torch.float32)[None, :, None].expand(self.BT, -1, -1).to(
+                fitnesses)
+
+            ## recompute the masks
+            occupied_regions = self.sg_phenotypes_func(
+                soft_index(plateau.permute(0, 3, 1, 2), agents, scale_by_imsize=True))
+            masks_pred = masks_from_phenotypes(plateau, occupied_regions, normalize=True)  # [BT,N,M]
+
+            ## have each pair of agents compete.
+            ## If their masks overlap, the winner is the one with higher fitness
+            alive = compete_agents(masks_pred, fitnesses, alive,
+                                   mask_thresh=self.mask_thresh,
+                                   compete_thresh=self.compete_thresh,
+                                   sticky_winners=self.sticky_winners)
+
+            alive *= in_bounds.to(alive)
+            alive_t = torch.transpose(alive, 1, 2)
+
+            # print("Num alive masks", alive.sum())
+
+            ## update which parts of the plateau are "unharvested"
+            unharvested = torch.minimum(self.reduce_func(masks_pred * alive_t, dim=-1, keepdim=True),
+                                        torch.tensor(1.0, dtype=torch.float32).to(masks_pred))
+            unharvested = 1.0 - unharvested.view(self.BT, self.H, self.W, 1)
+
+            ## update phenotypes of the winners
+            if self.mask_thresh is not None:
+                winner_phenotypes = (masks_pred[..., None] > self.mask_thresh).to(plateau)
+            winner_phenotypes = winner_phenotypes * plateau.view(self.BT, self.N, 1, self.Q)
+            winner_phenotypes = self.normalization_func(winner_phenotypes.mean(dim=1))  # [BT,M,Q]
+            phenotypes += (alive * winner_phenotypes) * self.selection_strength
+
+            ## reinitialize losing agent positions
+            alive_mask = (alive > 0.5).to(torch.float32)
+            loser_agents = sample_coordinates_at_borders(
+                plateau.permute(0, 3, 1, 2), num_points=self.M,
+                mask=unharvested.permute(0, 3, 1, 2),
+                sum_edges=self.sum_edges)
+            agents = agents * alive_mask + loser_agents * (1.0 - alive_mask)
+
+            ## reinitialize loser agent phenotypes
+            loser_phenotypes = self.normalization_func(
+                compute_distance_weighted_vectors(plateau, agents, mask=unharvested, beta=self.homing_strength))
+            phenotypes = alive_mask * phenotypes + (1.0 - alive_mask) * loser_phenotypes
+            phenotypes = self.normalization_func(phenotypes)
+
+        ## run a final competition between the surviving masks
+        if self.mask_beta is not None:
+            masks_pred = F.softmax(
+                self.mask_beta * masks_pred * alive_t - \
+                self.mask_beta * (1.0 - alive_t), dim=-1)
+        if self.mask_dead_segments:
+            masks_pred *= alive_t
+
+        masks_pred = masks_pred.view(self.BT, self.H, self.W, self.M)
+        if self.is_temporal:
+            masks_pred = self.reshape_batch_time(plateau, merge=False)
+            agents = self.reshape_batch_time(agents, merge=False)
+            alive = self.reshape_batch_time(alive, merge=False)
+            phenotype = self.reshape_batch_time(phenotype, merge=False)
+            unharvested = self.reshape_batch_time(unharvested, merge=False)
+
+        return (masks_pred, agents, alive, phenotypes, unharvested)
+
 
 
 def coordinate_ims(batch_size, seq_length, imsize):
@@ -71,7 +316,7 @@ def sample_image_inds_from_probs(probs, num_points, eps=1e-8):
     indices = dist.sample([P]).permute(1, 0).to(torch.int32)  # [B,P]
 
     # indices_h = torch.minimum(torch.maximum(torch.div(indices, W, rounding_mode='floor'), torch.tensor(0)), torch.tensor(H-1))
-    indices_h = torch.minimum(torch.maximum(indices // W, torch.tensor(0).to(indices)), torch.tensor(H - 1).to(indices))
+    indices_h = torch.minimum(torch.maximum(torch.div(indices, W, rounding_mode='floor'), torch.tensor(0).to(indices)), torch.tensor(H - 1).to(indices))
     indices_w = torch.minimum(torch.maximum(torch.fmod(indices, W), torch.tensor(0).to(indices)), torch.tensor(W - 1).to(indices))
     indices = torch.stack([indices_h, indices_w], dim=-1)  # [B,P,2]
     return indices
@@ -334,250 +579,6 @@ def masks_from_phenotypes(plateau, phenotypes, normalize=True):
     return masks
 
 
-class Competition(nn.Module):
-
-    def __init__(
-            self,
-            size=None,
-            num_masks=16,
-            num_competition_rounds=5,
-            mask_beta=10.0,
-            reduce_func=reduce_max,
-            stop_gradient=True,
-            stop_gradient_phenotypes=True,
-            normalization_func=l2_normalize,
-            sum_edges=True,
-            mask_thresh=0.5,
-            compete_thresh=0.2,
-            sticky_winners=True,
-            selection_strength=100.0,
-            homing_strength=10.0,
-            mask_dead_segments=True
-    ):
-        super().__init__()
-        self.num_masks = self.M = num_masks
-        self.num_competition_rounds = num_competition_rounds
-        self.mask_beta = mask_beta
-        self.reduce_func = reduce_func
-        self.normalization_func = normalization_func
-
-        ## stop gradients
-        self.sg_func = lambda x: (x.detach() if stop_gradient else x)
-        self.sg_phenotypes_func = lambda x: (x.detach() if stop_gradient_phenotypes else x)
-
-        ## agent sampling kwargs
-        self.sum_edges = sum_edges
-
-        ## competition kwargs
-        self.mask_thresh = mask_thresh
-        self.compete_thresh = compete_thresh
-        self.sticky_winners = sticky_winners
-        self.selection_strength = selection_strength
-        self.homing_strength = homing_strength
-        self.mask_dead_segments = mask_dead_segments
-
-        ## shapes
-        self.B = self.T = self.BT = self.N = self.Q = None
-        self.size = size  # [H,W]
-        if self.size:
-            assert len(self.size) == 2, self.size
-
-    def reshape_batch_time(self, x, merge=True):
-
-        if merge:
-            self.is_temporal = True
-            B, T = x.size()[0:2]
-            if self.B:
-                assert (B == self.B), (B, self.B)
-            else:
-                self.B = B
-
-            if self.T:
-                assert (T == self.T), (T, self.T)
-            else:
-                self.T = T
-
-            assert B * T == (self.B * self.T), (B * T, self.B * self.T)
-            if self.BT is None:
-                self.BT = self.B * self.T
-
-            return torch.reshape(x, [self.BT] + list(x.size())[2:])
-
-        else:  # split
-            BT = x.size()[0]
-            assert self.B and self.T, (self.B, self.T)
-            if self.BT is not None:
-                assert BT == self.BT, (BT, self.BT)
-            else:
-                self.BT = BT
-
-            return torch.reshape(x, [self.B, self.T] + list(x.size())[1:])
-
-    def process_plateau_input(self, plateau):
-
-        shape = plateau.size()
-        if len(shape) == 5:
-            self.is_temporal = True
-            self.B, self.T, self.H, self.W, self.Q = shape
-            self.N = self.H * self.W
-            self.BT = self.B * self.T
-            plateau = self.reshape_batch_time(plateau)
-        elif (len(shape) == 4) and (self.size is None):
-            self.is_temporal = False
-            self.B, self.H, self.W, self.Q = shape
-            self.N = self.H * self.W
-            self.T = 1
-            self.BT = self.B * self.T
-        elif (len(shape) == 4) and (self.size is not None):
-            self.is_temporal = True
-            self.B, self.T, self.N, self.Q = shape
-            self.BT = self.B * self.T
-            self.H, self.W = self.size
-            plateau = self.reshape_batch_time(plateau)
-            plateau = torch.reshape(plateau, [self.BT, self.H, self.W, self.Q])
-        elif len(shape) == 3:
-            assert self.size is not None, \
-                "You need to specify an image size to reshape the plateau of shape %s" % shape
-            self.is_temporal = False
-            self.B, self.N, self.Q = shape
-            self.T = 1
-            self.BT = self.B
-            self.H, self.W = self.size
-            plateau = torch.reshape(plateau, [self.BT, self.H, self.W, self.Q])
-        else:
-            raise ValueError("input plateau map with shape %s cannot be reshaped to [BT, H, W, Q]" % shape)
-
-        return plateau
-
-    def forward(self, plateau):
-        """
-        Find the uniform regions within the plateau map 
-        by competition between visual "indices."
-
-        args:
-            plateau: [B,[T],H,W,Q] feature map with smooth "plateaus"
-           
-        returns:
-            masks: [B, [T], H, W, M] <float> one mask in each of M channels
-            agents: [B, [T], M, 2] <float> positions of agents in normalized coordinates
-            alive: [B, [T], M] <float> binary vector indicating which masks are valid
-            phenotypes: [B, [T], M, Q] 
-            unharvested: [B, [T], H, W] <float> map of regions that weren't covered
-    
-        """
-
-        ## preprocess
-        plateau = self.process_plateau_input(plateau)  # [BT,H,W,Q]
-        plateau = self.normalization_func(plateau)
-
-        ## sample initial indices ("agents") from borders of the plateau map
-        agents = sample_coordinates_at_borders(
-            plateau.permute(0, 3, 1, 2), num_points=self.M, mask=None, sum_edges=self.sum_edges)
-
-        ## initially all of these agents are "alive"
-        alive = torch.ones_like(agents[..., -1:])  # [BT,M,1]
-
-        ## the agents have "phenotypes" depending on where they're situated on the plateau map
-        phenotypes = self.sg_phenotypes_func(
-            self.normalization_func(soft_index(plateau.permute(0, 3, 1, 2), agents, scale_by_imsize=True)))
-
-        ## the "fitness" of an agent -- how likely it is to survive competition --
-        ## is how well its phenotype matches the plateau vector at its current position
-        fitnesses = compute_compatibility(agents, plateau, phenotypes, availability=None, noise=0.1)
-
-        ## compute the masks at initialization
-        masks_pred = masks_from_phenotypes(plateau, phenotypes, normalize=True)
-
-        ## find the "unharvested" regions of the plateau map not covered by agents
-        unharvested = torch.minimum(self.reduce_func(masks_pred, dim=-1, keepdim=True), torch.tensor(1.0).to(masks_pred))
-        unharvested = 1.0 - unharvested.view(self.BT, self.H, self.W, 1)
-
-        for r in range(self.num_competition_rounds):
-            # print("Evolution round {}".format(r + 1))
-
-            ## compute the "availability" of the plateau map for each agent (i.e. where it can harvest from)
-            alive_t = torch.transpose(alive, 1, 2)  # [BT, 1, M]
-            availability = alive_t * masks_pred + (1.0 - alive_t) * unharvested.view(self.BT, self.N, 1)
-            availability = availability.view(self.BT, self.H, self.W, self.M)
-
-            ## update the fitnesses
-            fitnesses = compute_compatibility(
-                positions=agents,
-                plateau=plateau,
-                phenotypes=phenotypes,
-                availability=availability)
-
-            ## kill agents that have wandered off the map
-            in_bounds = torch.all(
-                torch.logical_and(agents < 1.0, agents > -1.0),
-                dim=-1, keepdim=True)  # [BT,M,1]
-            fitnesses *= in_bounds.to(fitnesses)
-
-            ## break ties in fitness
-            fitnesses -= 0.001 * torch.arange(self.M, dtype=torch.float32)[None, :, None].expand(self.BT, -1, -1).to(fitnesses)
-
-            ## recompute the masks
-            occupied_regions = self.sg_phenotypes_func(
-                soft_index(plateau.permute(0, 3, 1, 2), agents, scale_by_imsize=True))
-            masks_pred = masks_from_phenotypes(plateau, occupied_regions, normalize=True)  # [BT,N,M]
-
-            ## have each pair of agents compete.
-            ## If their masks overlap, the winner is the one with higher fitness
-            alive = compete_agents(masks_pred, fitnesses, alive,
-                                   mask_thresh=self.mask_thresh,
-                                   compete_thresh=self.compete_thresh,
-                                   sticky_winners=self.sticky_winners)
-
-            alive *= in_bounds.to(alive)
-            alive_t = torch.transpose(alive, 1, 2)
-
-            # print("Num alive masks", alive.sum())
-
-            ## update which parts of the plateau are "unharvested"
-            unharvested = torch.minimum(self.reduce_func(masks_pred * alive_t, dim=-1, keepdim=True),
-                                        torch.tensor(1.0, dtype=torch.float32).to(masks_pred))
-            unharvested = 1.0 - unharvested.view(self.BT, self.H, self.W, 1)
-
-            ## update phenotypes of the winners
-            if self.mask_thresh is not None:
-                winner_phenotypes = (masks_pred[..., None] > self.mask_thresh).to(plateau)
-            winner_phenotypes = winner_phenotypes * plateau.view(self.BT, self.N, 1, self.Q)
-            winner_phenotypes = self.normalization_func(winner_phenotypes.mean(dim=1))  # [BT,M,Q]
-            phenotypes += (alive * winner_phenotypes) * self.selection_strength
-
-            ## reinitialize losing agent positions
-            alive_mask = (alive > 0.5).to(torch.float32)
-            loser_agents = sample_coordinates_at_borders(
-                plateau.permute(0, 3, 1, 2), num_points=self.M,
-                mask=unharvested.permute(0, 3, 1, 2),
-                sum_edges=self.sum_edges)
-            agents = agents * alive_mask + loser_agents * (1.0 - alive_mask)
-
-            ## reinitialize loser agent phenotypes
-            loser_phenotypes = self.normalization_func(
-                compute_distance_weighted_vectors(plateau, agents, mask=unharvested, beta=self.homing_strength))
-            phenotypes = alive_mask * phenotypes + (1.0 - alive_mask) * loser_phenotypes
-            phenotypes = self.normalization_func(phenotypes)
-
-            ## that's it for this round!
-
-        ## run a final competition between the surviving masks
-        if self.mask_beta is not None:
-            masks_pred = F.softmax(
-                self.mask_beta * masks_pred * alive_t - \
-                self.mask_beta * (1.0 - alive_t), dim=-1)
-        if self.mask_dead_segments:
-            masks_pred *= alive_t
-
-        masks_pred = masks_pred.view(self.BT, self.H, self.W, self.M)
-        if self.is_temporal:
-            masks_pred = self.reshape_batch_time(plateau, merge=False)
-            agents = self.reshape_batch_time(agents, merge=False)
-            alive = self.reshape_batch_time(alive, merge=False)
-            phenotype = self.reshape_batch_time(phenotype, merge=False)
-            unharvested = self.reshape_batch_time(unharvested, merge=False)
-
-        return (masks_pred, agents, alive, phenotypes, unharvested)
 
 
 def object_id_hash(objects, dtype_out=torch.int32, val=256, channels_last=False):
