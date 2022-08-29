@@ -90,9 +90,9 @@ class GraphPropagation(nn.Module):
     def propagate(self, h, adj_e, adj_i, activated, running_activated, sample_mask, iter):
         B, N, D = h.shape
 
-        # Graph propagation start at a subset of activated nodes
-        # If self.activation_converge is False, i.e. not all nodes are activated,
-        # we need to apply masking to the affinities and compute the normalization factor accordingly
+        # Graph propagation starts at a subset of activated nodes
+        # If self.activation_converge is False, i.e. not all nodes are activated, \
+        #   we need to apply masking to the affinities and compute the normalization factor accordingly.
         # We do so until all the nodes are activated, i.e.  self.activation_converge == True
 
         if not self.activation_converge:

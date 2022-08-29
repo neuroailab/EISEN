@@ -66,7 +66,6 @@ class EISEN(nn.Module):
         self.register_buffer("pixel_std", torch.Tensor([58.395, 57.12, 57.375]).view(1, -1, 1, 1), False)
 
     def forward(self, input, segment_target, get_segments=False, vis_segments=False):
-        """ build outputs at multiple levels"""
         # [Normalize inputs]
         img = (input['img1'] - self.pixel_mean) / self.pixel_std
 
